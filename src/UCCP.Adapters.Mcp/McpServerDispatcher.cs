@@ -148,7 +148,7 @@ namespace UCCP.Adapters.Mcp
             if (toolName.Equals("uccp_list_domains", StringComparison.OrdinalIgnoreCase))
             {
                 var domains = await _registry.GetDomainsAsync(principal).ConfigureAwait(false);
-                var text = JArray.FromObject(domains).ToString();
+                var text = Newtonsoft.Json.JsonConvert.SerializeObject(domains, Newtonsoft.Json.Formatting.Indented);
                 return new CallToolResult
                 {
                     Content = new List<ContentBlock> { new ContentBlock { Text = text } }
@@ -162,7 +162,7 @@ namespace UCCP.Adapters.Mcp
                 var query = arguments["query"]?.ToString();
 
                 var capabilities = await _registry.SearchCapabilitiesAsync(domain, query, principal).ConfigureAwait(false);
-                var text = JArray.FromObject(capabilities).ToString();
+                var text = Newtonsoft.Json.JsonConvert.SerializeObject(capabilities, Newtonsoft.Json.Formatting.Indented);
                 return new CallToolResult
                 {
                     Content = new List<ContentBlock> { new ContentBlock { Text = text } }
@@ -205,7 +205,7 @@ namespace UCCP.Adapters.Mcp
 
                 return new CallToolResult
                 {
-                    Content = new List<ContentBlock> { new ContentBlock { Text = schemaDoc.ToString() } }
+                    Content = new List<ContentBlock> { new ContentBlock { Text = Newtonsoft.Json.JsonConvert.SerializeObject(schemaDoc, Newtonsoft.Json.Formatting.Indented) } }
                 };
             }
 
@@ -222,9 +222,23 @@ namespace UCCP.Adapters.Mcp
 
             if (response.Status == ExecutionStatus.Success)
             {
-                var outputText = !string.IsNullOrEmpty(response.Summary)
-                    ? response.Summary
-                    : response.Data?.ToString();
+                var sb = new System.Text.StringBuilder();
+                if (!string.IsNullOrEmpty(response.Summary))
+                {
+                    sb.AppendLine(response.Summary);
+                }
+
+                if (!string.IsNullOrEmpty(response.ContextHandle))
+                {
+                    sb.AppendLine($"[ContextHandle: {response.ContextHandle}]");
+                }
+
+                if (response.Data != null && response.Data.Count > 0)
+                {
+                    sb.AppendLine($"[Data: {Newtonsoft.Json.JsonConvert.SerializeObject(response.Data)}]");
+                }
+
+                var outputText = sb.Length > 0 ? sb.ToString().TrimEnd() : "Execution completed successfully.";
 
                 return new CallToolResult
                 {
