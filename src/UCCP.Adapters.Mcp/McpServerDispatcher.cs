@@ -76,21 +76,21 @@ namespace UCCP.Adapters.Mcp
         {
             var tools = new List<McpTool>
             {
-                // Progressive Discovery Meta-Tool 1: List domains
+                // Progressive Discovery Stage 1: List domains
                 new McpTool
                 {
                     Name = "uccp_list_domains",
-                    Description = "Progressive Discovery: Returns all available enterprise business domains and their capability counts.",
+                    Description = "Progressive Discovery Stage 1: Returns all available enterprise business domains and their capability counts.",
                     InputSchema = JObject.Parse(@"{
                         ""type"": ""object"",
                         ""properties"": {}
                     }")
                 },
-                // Progressive Discovery Meta-Tool 2: Search capabilities
+                // Progressive Discovery Stage 2: Search capabilities
                 new McpTool
                 {
                     Name = "uccp_search_capabilities",
-                    Description = "Progressive Discovery: Searches for relevant enterprise capabilities by business domain or keywords without bloating prompts.",
+                    Description = "Progressive Discovery Stage 2: Searches for relevant enterprise capabilities by business domain or keywords without bloating prompts.",
                     InputSchema = JObject.Parse(@"{
                         ""type"": ""object"",
                         ""properties"": {
@@ -98,6 +98,19 @@ namespace UCCP.Adapters.Mcp
                             ""query"": { ""type"": ""string"", ""description"": ""Keywords describing user intent (e.g. 'check stock', 'create po')."" }
                         },
                         ""required"": [""domain""]
+                    }")
+                },
+                // Progressive Discovery Stage 3: Lazy Schema Hydration
+                new McpTool
+                {
+                    Name = "uccp_get_capability_schema",
+                    Description = "Progressive Discovery Stage 3: Retrieves the detailed input and output JSON schema for a target capability before calling it.",
+                    InputSchema = JObject.Parse(@"{
+                        ""type"": ""object"",
+                        ""properties"": {
+                            ""capabilityId"": { ""type"": ""string"", ""description"": ""Target capability identifier (e.g. 'inventory.material.stock.query@v1.0')."" }
+                        },
+                        ""required"": [""capabilityId""]
                     }")
                 }
             };
@@ -153,6 +166,46 @@ namespace UCCP.Adapters.Mcp
                 return new CallToolResult
                 {
                     Content = new List<ContentBlock> { new ContentBlock { Text = text } }
+                };
+            }
+
+            // Handle Meta-Tool 3: Get Schema on-demand
+            if (toolName.Equals("uccp_get_capability_schema", StringComparison.OrdinalIgnoreCase))
+            {
+                var capId = arguments["capabilityId"]?.ToString();
+                if (string.IsNullOrEmpty(capId))
+                {
+                    return new CallToolResult
+                    {
+                        IsError = true,
+                        Content = new List<ContentBlock> { new ContentBlock { Text = "capabilityId parameter is required." } }
+                    };
+                }
+
+                var descriptor = await _registry.GetDescriptorAsync(capId).ConfigureAwait(false);
+                if (descriptor == null)
+                {
+                    return new CallToolResult
+                    {
+                        IsError = true,
+                        Content = new List<ContentBlock> { new ContentBlock { Text = $"Capability '{capId}' not found." } }
+                    };
+                }
+
+                var schemaDoc = new JObject
+                {
+                    ["id"] = descriptor.Id,
+                    ["name"] = descriptor.Name,
+                    ["domain"] = descriptor.Domain,
+                    ["description"] = descriptor.Description,
+                    ["action"] = descriptor.Action.ToString(),
+                    ["inputSchema"] = descriptor.InputSchema ?? new JObject(),
+                    ["outputSchema"] = descriptor.OutputSchema ?? new JObject()
+                };
+
+                return new CallToolResult
+                {
+                    Content = new List<ContentBlock> { new ContentBlock { Text = schemaDoc.ToString() } }
                 };
             }
 

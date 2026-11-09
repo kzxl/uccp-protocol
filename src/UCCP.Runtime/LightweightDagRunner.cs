@@ -14,10 +14,78 @@ namespace UCCP.Runtime.Workflow
     public class LightweightDagRunner : IWorkflowEngine
     {
         private readonly InMemoryCapabilityRegistry _registry;
+        private const int MaxAllowedSteps = 50;
 
         public LightweightDagRunner(InMemoryCapabilityRegistry registry)
         {
             _registry = registry ?? throw new ArgumentNullException(nameof(registry));
+        }
+
+        public void ValidateWorkflow(WorkflowDefinition workflow)
+        {
+            if (workflow == null) throw new ArgumentNullException(nameof(workflow));
+            if (workflow.Steps == null || workflow.Steps.Count == 0)
+            {
+                throw new ArgumentException("Workflow must contain at least one step.", nameof(workflow));
+            }
+
+            if (workflow.Steps.Count > MaxAllowedSteps)
+            {
+                throw new ArgumentException($"Workflow exceeds maximum allowed steps cap ({MaxAllowedSteps}).", nameof(workflow));
+            }
+
+            // Cycle Detection using Kahn's Algorithm
+            var inDegree = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            var adjacency = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var step in workflow.Steps)
+            {
+                if (string.IsNullOrEmpty(step.StepId))
+                {
+                    throw new ArgumentException("Workflow step is missing StepId.", nameof(workflow));
+                }
+
+                inDegree[step.StepId] = step.DependsOn?.Count ?? 0;
+                adjacency[step.StepId] = new List<string>();
+            }
+
+            foreach (var step in workflow.Steps)
+            {
+                if (step.DependsOn != null)
+                {
+                    foreach (var dep in step.DependsOn)
+                    {
+                        if (!adjacency.ContainsKey(dep))
+                        {
+                            throw new InvalidOperationException($"Step '{step.StepId}' depends on nonexistent step '{dep}'.");
+                        }
+                        adjacency[dep].Add(step.StepId);
+                    }
+                }
+            }
+
+            var queue = new Queue<string>(inDegree.Where(kvp => kvp.Value == 0).Select(kvp => kvp.Key));
+            int processedCount = 0;
+
+            while (queue.Count > 0)
+            {
+                var curr = queue.Dequeue();
+                processedCount++;
+
+                foreach (var neighbor in adjacency[curr])
+                {
+                    inDegree[neighbor]--;
+                    if (inDegree[neighbor] == 0)
+                    {
+                        queue.Enqueue(neighbor);
+                    }
+                }
+            }
+
+            if (processedCount != workflow.Steps.Count)
+            {
+                throw new InvalidOperationException($"Circular dependency / loop detected in workflow '{workflow.WorkflowId}'. Kahn sort processed only {processedCount} of {workflow.Steps.Count} steps.");
+            }
         }
 
         public async Task<ExecutionResult> ExecuteWorkflowAsync(
@@ -27,6 +95,9 @@ namespace UCCP.Runtime.Workflow
             CancellationToken cancellationToken)
         {
             if (workflow == null) throw new ArgumentNullException(nameof(workflow));
+
+            // 1. Pre-validate DAG topology before starting execution
+            ValidateWorkflow(workflow);
 
             var stepResults = new Dictionary<string, ExecutionResult>(StringComparer.OrdinalIgnoreCase);
             var completedSteps = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -42,12 +113,12 @@ namespace UCCP.Runtime.Workflow
 
                     // Find steps ready to execute (all dependencies satisfied)
                     var readySteps = remainingSteps
-                        .Where(s => s.DependsOn.All(d => completedSteps.Contains(d)))
+                        .Where(s => s.DependsOn == null || s.DependsOn.All(d => completedSteps.Contains(d)))
                         .ToList();
 
                     if (readySteps.Count == 0)
                     {
-                        throw new InvalidOperationException($"Deadlock detected in workflow '{workflow.WorkflowId}': Circular dependency or unsatisfied prerequisites.");
+                        throw new InvalidOperationException($"Deadlock detected in workflow '{workflow.WorkflowId}': Unsatisfied step prerequisites.");
                     }
 
                     // Execute ready steps in parallel

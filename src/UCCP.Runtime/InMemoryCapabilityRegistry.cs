@@ -2,8 +2,10 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
+using System.Reflection;
 using System.Security.Claims;
 using System.Threading.Tasks;
+using UCCP.Core.Contracts.Attributes;
 using UCCP.Core.Contracts.Descriptors;
 using UCCP.Core.Contracts.Execution;
 
@@ -24,6 +26,61 @@ namespace UCCP.Runtime.Registry
 
             _descriptors[descriptor.Id] = descriptor;
             _executors[descriptor.Id] = executor;
+        }
+
+        public void RegisterFromAssembly(Assembly assembly, Func<Type, object> resolver = null)
+        {
+            if (assembly == null) throw new ArgumentNullException(nameof(assembly));
+
+            var executorTypes = assembly.GetTypes()
+                .Where(t => !t.IsAbstract && !t.IsInterface && typeof(ICapabilityExecutor).IsAssignableFrom(t));
+
+            foreach (var type in executorTypes)
+            {
+                var capAttr = type.GetCustomAttribute<UccpCapabilityAttribute>();
+                if (capAttr == null) continue;
+
+                var secAttr = type.GetCustomAttribute<UccpSecurityAttribute>();
+
+                var descriptor = new CapabilityDescriptor
+                {
+                    Id = capAttr.Id,
+                    Name = capAttr.Name ?? capAttr.Id,
+                    Domain = capAttr.Domain ?? "common",
+                    Subdomain = capAttr.Subdomain,
+                    Description = capAttr.Description,
+                    Action = capAttr.Action,
+                    Idempotent = capAttr.Idempotent,
+                    TimeoutMs = capAttr.TimeoutMs,
+                    Tags = capAttr.Tags != null ? new List<string>(capAttr.Tags) : new List<string>()
+                };
+
+                if (secAttr != null)
+                {
+                    descriptor.Security.RequiredRoles = secAttr.RequiredRoles != null
+                        ? new List<string>(secAttr.RequiredRoles)
+                        : new List<string>();
+
+                    descriptor.Security.RequiredPermissions = secAttr.RequiredPermissions != null
+                        ? new List<string>(secAttr.RequiredPermissions)
+                        : new List<string>();
+
+                    descriptor.Security.HumanApprovalRequired = secAttr.HumanApprovalRequired;
+                    descriptor.Security.RequiresAuditLog = secAttr.RequiresAuditLog;
+                }
+
+                ICapabilityExecutor executor;
+                if (resolver != null)
+                {
+                    executor = (ICapabilityExecutor)resolver(type);
+                }
+                else
+                {
+                    executor = (ICapabilityExecutor)Activator.CreateInstance(type);
+                }
+
+                Register(descriptor, executor);
+            }
         }
 
         public Task<CapabilityDescriptor> GetDescriptorAsync(string capabilityId)

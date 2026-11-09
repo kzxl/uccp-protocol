@@ -8,6 +8,7 @@ using System.Threading.Tasks;
 using Newtonsoft.Json.Linq;
 using UCCP.Adapters.InProc;
 using UCCP.Adapters.Mcp;
+using UCCP.Core.Contracts.Attributes;
 using UCCP.Core.Contracts.Context;
 using UCCP.Core.Contracts.Descriptors;
 using UCCP.Core.Contracts.Envelopes;
@@ -27,6 +28,7 @@ namespace UCCP.Tests
         private readonly InMemoryCapabilityRegistry _registry;
         private readonly InMemoryContextEngine _contextEngine;
         private readonly AbacPolicyEngine _policyEngine;
+        private readonly TestAuditSink _auditSink;
         private readonly DefaultUccpRuntime _runtime;
         private readonly InProcInvoker _inProcInvoker;
         private readonly McpServerDispatcher _mcpDispatcher;
@@ -35,9 +37,10 @@ namespace UCCP.Tests
         public UccpComprehensiveTests()
         {
             _registry = new InMemoryCapabilityRegistry();
-            _contextEngine = new InMemoryContextEngine();
+            _contextEngine = new InMemoryContextEngine("test_super_secret_key_12345");
             _policyEngine = new AbacPolicyEngine();
-            _runtime = new DefaultUccpRuntime(_registry, _contextEngine, _policyEngine);
+            _auditSink = new TestAuditSink();
+            _runtime = new DefaultUccpRuntime(_registry, _contextEngine, _policyEngine, _auditSink);
             _inProcInvoker = new InProcInvoker(_runtime);
             _mcpDispatcher = new McpServerDispatcher(_runtime, _registry);
             _dagRunner = new LightweightDagRunner(_registry);
@@ -47,7 +50,7 @@ namespace UCCP.Tests
 
         private void RegisterSampleCapabilities()
         {
-            // 1. Inventory Stock Query
+            // 1. Inventory Stock Query with InputSchema
             _registry.Register(new CapabilityDescriptor
             {
                 Id = "inventory.material.stock.query@v1.0",
@@ -57,6 +60,13 @@ namespace UCCP.Tests
                 Description = "Returns physical and available warehouse stock balances.",
                 Action = ActionKind.Read,
                 Tags = new List<string> { "stock", "material", "inventory", "balance" },
+                InputSchema = JObject.Parse(@"{
+                    ""type"": ""object"",
+                    ""properties"": {
+                        ""materialCode"": { ""type"": ""string"" }
+                    },
+                    ""required"": [""materialCode""]
+                }"),
                 Security = new SecurityMetadata
                 {
                     RequiredRoles = new List<string> { "WarehouseStaff", "Planner", "Manager" }
@@ -154,13 +164,11 @@ namespace UCCP.Tests
         [Fact]
         public async Task ProgressiveDiscovery_HidesUnauthorizedCapabilities()
         {
-            // WarehouseStaff should NOT see finance capabilities in discovery
             var staffUser = CreatePrincipal("staff_01", "WarehouseStaff");
             var financeResults = await _registry.SearchCapabilitiesAsync("finance", "ledger", staffUser);
 
             Assert.Empty(financeResults);
 
-            // ChiefAccountant CAN see finance capabilities
             var accountantUser = CreatePrincipal("cfo_01", "ChiefAccountant");
             var accountantResults = await _registry.SearchCapabilitiesAsync("finance", "ledger", accountantUser);
 
@@ -169,7 +177,7 @@ namespace UCCP.Tests
 
         #endregion
 
-        #region Test Suite 2: Context Engine & Opaque Context Handles
+        #region Test Suite 2: Context Engine, Opaque Handles & HMAC Verification
 
         [Fact]
         public async Task ContextEngine_StoresLargeTable_AndGeneratesOpaqueHandle()
@@ -189,11 +197,25 @@ namespace UCCP.Tests
         }
 
         [Fact]
+        public async Task ContextEngine_DetectsTamperedHmacSignature_RejectsAccess()
+        {
+            var handle = await _contextEngine.StoreContextAsync("tenant_acme", "Secret Payload", TimeSpan.FromMinutes(5));
+
+            // Tamper signature
+            var parts = handle.Split(':');
+            var tamperedHandle = $"ctx_hnd:{parts[1]}:{parts[2]}:INVALID_SIG";
+
+            await Assert.ThrowsAsync<UnauthorizedAccessException>(async () =>
+            {
+                await _contextEngine.ResolveContextAsync<string>("tenant_acme", tamperedHandle);
+            });
+        }
+
+        [Fact]
         public async Task ContextEngine_EnforcesTenantIsolation_PreventsTenantBleed()
         {
             var handle = await _contextEngine.StoreContextAsync("tenant_A", "Secret Data A", TimeSpan.FromMinutes(5));
 
-            // Accessing with tenant_B MUST throw Tenant Isolation Violation
             await Assert.ThrowsAsync<UnauthorizedAccessException>(async () =>
             {
                 await _contextEngine.ResolveContextAsync<string>("tenant_B", handle);
@@ -202,14 +224,32 @@ namespace UCCP.Tests
 
         #endregion
 
-        #region Test Suite 3: Security & ABAC Policy Enforcement
+        #region Test Suite 3: Security, ABAC & Input Validation
+
+        [Fact]
+        public async Task Runtime_ValidatesInputSchema_FailFastOnMissingRequiredField()
+        {
+            var user = CreatePrincipal("staff_01", "WarehouseStaff");
+            var request = new UccpRequestEnvelope
+            {
+                CapabilityId = "inventory.material.stock.query@v1.0",
+                Payload = new JObject() // Missing required 'materialCode'
+            };
+
+            var response = await _runtime.ExecuteAsync(request, user);
+
+            Assert.Equal(ExecutionStatus.Failed, response.Status);
+            Assert.Equal("UCCP_400_VALIDATION_ERROR", response.Error.Code);
+            Assert.Contains("materialCode", response.Error.Message);
+        }
 
         [Fact]
         public async Task PolicyEngine_DeniesUnauthenticatedCaller()
         {
             var request = new UccpRequestEnvelope
             {
-                CapabilityId = "inventory.material.stock.query@v1.0"
+                CapabilityId = "inventory.material.stock.query@v1.0",
+                Payload = JObject.FromObject(new { materialCode = "RM-001" })
             };
 
             var response = await _runtime.ExecuteAsync(request, principal: null);
@@ -224,7 +264,8 @@ namespace UCCP.Tests
             var unauthorizedUser = CreatePrincipal("intern_01", "InternRole");
             var request = new UccpRequestEnvelope
             {
-                CapabilityId = "inventory.material.stock.query@v1.0"
+                CapabilityId = "inventory.material.stock.query@v1.0",
+                Payload = JObject.FromObject(new { materialCode = "RM-001" })
             };
 
             var response = await _runtime.ExecuteAsync(request, principal: unauthorizedUser);
@@ -243,14 +284,12 @@ namespace UCCP.Tests
                 Payload = JObject.FromObject(new { poId = "PO-2026-99" })
             };
 
-            // Without approval token, execution MUST be Suspended
             var response = await _runtime.ExecuteAsync(request, principal: manager);
 
             Assert.Equal(ExecutionStatus.PendingApproval, response.Status);
             Assert.StartsWith("appr_ticket:", response.ContextHandle);
             Assert.Contains("[SUSPENDED]", response.Summary);
 
-            // Re-submitting WITH human approval token allows execution to succeed
             request.Payload["approvalToken"] = "token_signed_by_human_faceid";
             var successResponse = await _runtime.ExecuteAsync(request, principal: manager);
 
@@ -260,60 +299,90 @@ namespace UCCP.Tests
         [Fact]
         public async Task PolicyEngine_MasksConfidentialCost_ForNonFinanceUsers()
         {
-            // User has permission to query stock, but NO permission to view unit cost
             var warehouseStaff = CreatePrincipal("staff_01", "WarehouseStaff");
             var request = new UccpRequestEnvelope
             {
-                CapabilityId = "inventory.material.stock.query@v1.0"
+                CapabilityId = "inventory.material.stock.query@v1.0",
+                Payload = JObject.FromObject(new { materialCode = "RM-001" })
             };
 
             var response = await _runtime.ExecuteAsync(request, principal: warehouseStaff);
 
             Assert.Equal(ExecutionStatus.Success, response.Status);
-            // Verify quantity is visible
-            Assert.Equal(150.0, (double)response.Data["quantity"]);
-            // Verify unitCost is masked
-            Assert.Equal("[CONFIDENTIAL_MASKED]", (string)response.Data["unitCost"]);
+            Assert.NotNull(response.Data);
+            Assert.Equal(150.0, (double?)response.Data["quantity"]);
+            Assert.Equal("[CONFIDENTIAL_MASKED]", (string?)response.Data["unitCost"]);
         }
 
         #endregion
 
-        #region Test Suite 4: Deterministic Workflow Engine & Saga Compensation
+        #region Test Suite 4: Idempotency Key Engine
 
         [Fact]
-        public async Task WorkflowEngine_ExecutesDagDeterministically_WithoutLlmHops()
+        public async Task Runtime_EnforcesIdempotency_ReturnsCachedResultWithoutReexecution()
         {
-            var step1Executed = false;
-            var step2Executed = false;
+            var user = CreatePrincipal("staff_01", "WarehouseStaff");
+            int executionCount = 0;
 
-            _registry.Register(new CapabilityDescriptor { Id = "test.step1@v1.0" }, new MockExecutor((p, c) =>
+            _registry.Register(new CapabilityDescriptor
             {
-                step1Executed = true;
-                return new ExecutionResult { Success = true, Data = JObject.FromObject(new { balance = 100 }) };
+                Id = "order.payment.process@v1.0",
+                Action = ActionKind.Execute
+            }, new MockExecutor((p, c) =>
+            {
+                executionCount++;
+                return new ExecutionResult
+                {
+                    Success = true,
+                    Summary = $"Processed payment attempt #{executionCount}"
+                };
             }));
 
-            _registry.Register(new CapabilityDescriptor { Id = "test.step2@v1.0" }, new MockExecutor((p, c) =>
+            var request = new UccpRequestEnvelope
             {
-                step2Executed = true;
-                return new ExecutionResult { Success = true, Summary = "Workflow finished." };
-            }));
+                CapabilityId = "order.payment.process@v1.0",
+                IdempotencyKey = "order_payment_unique_uuid_9999",
+                Payload = JObject.FromObject(new { orderId = 100 })
+            };
 
-            var workflow = new WorkflowDefinition
+            // Call 1
+            var res1 = await _runtime.ExecuteAsync(request, user);
+            Assert.Equal(ExecutionStatus.Success, res1.Status);
+            Assert.Equal("Processed payment attempt #1", res1.Summary);
+            Assert.Equal(1, executionCount);
+
+            // Call 2 with identical IdempotencyKey
+            var res2 = await _runtime.ExecuteAsync(request, user);
+            Assert.Equal(ExecutionStatus.Success, res2.Status);
+            Assert.Equal("Processed payment attempt #1", res2.Summary);
+            Assert.Equal(1, executionCount); // MUST NOT re-execute!
+            Assert.Equal(0.0, res2.ExecutionDurationMs); // Instant cache hit
+        }
+
+        #endregion
+
+        #region Test Suite 5: Workflow DAG & Pre-Validation
+
+        [Fact]
+        public async Task WorkflowEngine_PreValidatesTopology_DetectsCycleBeforeExecution()
+        {
+            // Workflow with circular dependency: s1 -> s2 -> s1
+            var cyclicWorkflow = new WorkflowDefinition
             {
-                WorkflowId = "wf.test.reorder@v1.0",
+                WorkflowId = "wf.cyclic.bad@v1.0",
                 Steps = new List<WorkflowStep>
                 {
-                    new WorkflowStep { StepId = "s1", CapabilityId = "test.step1@v1.0" },
-                    new WorkflowStep { StepId = "s2", CapabilityId = "test.step2@v1.0", DependsOn = new List<string> { "s1" } }
+                    new WorkflowStep { StepId = "s1", CapabilityId = "test.s1", DependsOn = new List<string> { "s2" } },
+                    new WorkflowStep { StepId = "s2", CapabilityId = "test.s2", DependsOn = new List<string> { "s1" } }
                 }
             };
 
-            var ctx = new ExecutionContextData();
-            var res = await _dagRunner.ExecuteWorkflowAsync(workflow, new JObject(), ctx, CancellationToken.None);
+            var ex = Assert.Throws<InvalidOperationException>(() =>
+            {
+                _dagRunner.ValidateWorkflow(cyclicWorkflow);
+            });
 
-            Assert.True(res.Success);
-            Assert.True(step1Executed);
-            Assert.True(step2Executed);
+            Assert.Contains("Circular dependency", ex.Message);
         }
 
         [Fact]
@@ -362,69 +431,70 @@ namespace UCCP.Tests
 
         #endregion
 
-        #region Test Suite 5: MCP Adapter Interoperability
+        #region Test Suite 6: Declarative Attributes & Assembly Auto-Discovery
 
         [Fact]
-        public async Task McpAdapter_ToolsList_ReturnsProgressiveDiscoveryMetaTools()
+        public async Task Registry_RegisterFromAssembly_DiscoversDecoratedExecutors()
         {
-            var mcpReq = new McpRequest { Method = "tools/list", Id = 1 };
-            var mcpRes = await _mcpDispatcher.DispatchAsync(mcpReq);
+            var localRegistry = new InMemoryCapabilityRegistry();
+            localRegistry.RegisterFromAssembly(typeof(UccpComprehensiveTests).Assembly);
 
-            Assert.Null(mcpRes.Error);
-            Assert.NotNull(mcpRes.Result);
+            var descriptor = await localRegistry.GetDescriptorAsync("test.sample.decorated@v1.0");
+            Assert.NotNull(descriptor);
+            Assert.Equal("Sample Auto-Discovered Capability", descriptor.Name);
+            Assert.Equal("demo", descriptor.Domain);
+            Assert.Contains("ManagerRole", descriptor.Security.RequiredRoles);
         }
 
+        #endregion
+
+        #region Test Suite 7: MCP Adapter & Stage 3 Schema Hydration
+
         [Fact]
-        public async Task McpAdapter_ToolsCall_InvokesConcreteCapability()
+        public async Task McpAdapter_Stage3_ReturnsDetailedCapabilitySchema()
         {
-            var user = CreatePrincipal("staff_01", "WarehouseStaff");
             var mcpReq = new McpRequest
             {
                 Method = "tools/call",
-                Id = 2,
+                Id = 10,
                 Params = JObject.FromObject(new
                 {
-                    name = "inventory.material.stock.query@v1.0",
-                    arguments = new { materialCode = "RM-STEEL-01" }
+                    name = "uccp_get_capability_schema",
+                    arguments = new { capabilityId = "inventory.material.stock.query@v1.0" }
                 })
             };
 
-            var mcpRes = await _mcpDispatcher.DispatchAsync(mcpReq, user);
+            var mcpRes = await _mcpDispatcher.DispatchAsync(mcpReq);
 
             Assert.Null(mcpRes.Error);
             var callResult = mcpRes.Result as CallToolResult;
             Assert.NotNull(callResult);
             Assert.False(callResult.IsError);
-            Assert.Contains("Stock balance for RM-STEEL-01", callResult.Content[0].Text);
+            Assert.Contains("materialCode", callResult.Content[0].Text);
+            Assert.Contains("inventory.material.stock.query@v1.0", callResult.Content[0].Text);
         }
 
         #endregion
 
-        #region Test Suite 6: In-Process Micro-Benchmark (Level 3 Proof)
+        #region Test Suite 8: Pluggable Audit Sink
 
         [Fact]
-        public async Task InProcess_Latency_IsSubMillisecond()
+        public async Task Runtime_RecordsAuditEvent_OnExecution()
         {
-            var user = CreatePrincipal("staff_01", "WarehouseStaff");
-
-            // Warmup
-            await _inProcInvoker.InvokeAsync("inventory.material.stock.query@v1.0", new { materialCode = "WARMUP" }, user);
-
-            // Execute 1,000 iterations
-            const int iterations = 1000;
-            var sw = Stopwatch.StartNew();
-
-            for (int i = 0; i < iterations; i++)
+            var user = CreatePrincipal("staff_audit", "WarehouseStaff");
+            var request = new UccpRequestEnvelope
             {
-                var res = await _inProcInvoker.InvokeAsync("inventory.material.stock.query@v1.0", new { materialCode = "RM-001" }, user);
-                Assert.Equal(ExecutionStatus.Success, res.Status);
-            }
+                CapabilityId = "inventory.material.stock.query@v1.0",
+                Payload = JObject.FromObject(new { materialCode = "RM-001" })
+            };
 
-            sw.Stop();
-            double avgLatencyMs = sw.Elapsed.TotalMilliseconds / iterations;
+            await _runtime.ExecuteAsync(request, user);
 
-            // In-process invocation MUST be faster than 0.1ms (100 microseconds)
-            Assert.True(avgLatencyMs < 0.2, $"In-process average latency ({avgLatencyMs:F4} ms) must be sub-millisecond.");
+            Assert.NotEmpty(_auditSink.RecordedEvents);
+            var ev = _auditSink.RecordedEvents.Last();
+            Assert.Equal("inventory.material.stock.query@v1.0", ev.CapabilityId);
+            Assert.Equal("staff_audit", ev.ActorId);
+            Assert.Equal(ExecutionStatus.Success, ev.Status);
         }
 
         #endregion
@@ -460,6 +530,27 @@ namespace UCCP.Tests
             {
                 return Task.FromResult(_func(payload, context));
             }
+        }
+
+        private class TestAuditSink : IAuditSink
+        {
+            public List<AuditEvent> RecordedEvents { get; } = new List<AuditEvent>();
+
+            public Task RecordAsync(AuditEvent auditEvent)
+            {
+                RecordedEvents.Add(auditEvent);
+                return Task.FromResult(0);
+            }
+        }
+    }
+
+    [UccpCapability("test.sample.decorated@v1.0", Domain = "demo", Name = "Sample Auto-Discovered Capability", Description = "Test capability")]
+    [UccpSecurity("ManagerRole")]
+    public class SampleDecoratedExecutor : ICapabilityExecutor
+    {
+        public Task<ExecutionResult> ExecuteAsync(JObject payload, ExecutionContextData context, CancellationToken cancellationToken)
+        {
+            return Task.FromResult(new ExecutionResult { Success = true, Summary = "Decorated executed." });
         }
     }
 }

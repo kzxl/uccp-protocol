@@ -59,4 +59,24 @@ namespace UCCP.Core.Contracts.Execution
             ClaimsPrincipal principal = null,
             CancellationToken cancellationToken = default(CancellationToken));
     }
+
+    public class AuditEvent
+    {
+        public string EventId { get; set; } = Guid.NewGuid().ToString("D");
+        public string RequestId { get; set; }
+        public string CorrelationId { get; set; }
+        public string CapabilityId { get; set; }
+        public string ActorId { get; set; }
+        public string TenantId { get; set; }
+        public ExecutionStatus Status { get; set; }
+        public double DurationMs { get; set; }
+        public DateTime TimestampUtc { get; set; } = DateTime.UtcNow;
+        public string Summary { get; set; }
+        public string ErrorCode { get; set; }
+    }
+
+    public interface IAuditSink
+    {
+        Task RecordAsync(AuditEvent auditEvent);
+    }
 }
