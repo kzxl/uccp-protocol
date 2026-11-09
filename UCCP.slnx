@@ -1,0 +1,11 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/UCCP.Adapters.InProc/UCCP.Adapters.InProc.csproj" />
+    <Project Path="src/UCCP.Adapters.Mcp/UCCP.Adapters.Mcp.csproj" />
+    <Project Path="src/UCCP.Core/UCCP.Core.csproj" />
+    <Project Path="src/UCCP.Runtime/UCCP.Runtime.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/UCCP.Tests/UCCP.Tests.csproj" />
+  </Folder>
+</Solution>

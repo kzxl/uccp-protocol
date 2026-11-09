@@ -1,0 +1,16 @@
+## Build results
+[Bb]in/
+[Oo]bj/
+artifacts/
+[Tt]emp/
+
+## Visual Studio
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+## OS Files
+.DS_Store
+Thumbs.db
