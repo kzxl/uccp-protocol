@@ -87,10 +87,15 @@ jobs:
             --skip-duplicate || true
 
       - name: Push to NuGet.org
-        if: ${{ secrets.NUGET_API_KEY != '' }}
+        shell: bash
         env:
           NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
         run: |
+          if [ -z "$NUGET_API_KEY" ]; then
+            echo "::notice::NUGET_API_KEY secret is not set in GitHub repository settings. Skipping push to NuGet.org."
+            exit 0
+          fi
+          echo "Pushing packages to NuGet.org..."
           dotnet nuget push "artifacts/packages/*.nupkg" \
             --api-key "$NUGET_API_KEY" \
             --source https://api.nuget.org/v3/index.json \
