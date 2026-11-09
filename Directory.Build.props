@@ -1,0 +1,15 @@
+<Project>
+  <PropertyGroup>
+    <Authors>kzxl</Authors>
+    <Company>kzxl</Company>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <RepositoryUrl>https://github.com/kzxl/uccp-protocol</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageProjectUrl>https://github.com/kzxl/uccp-protocol</PackageProjectUrl>
+    <PackageTags>uccp;mcp;model-context-protocol;ai-agent;runtime;abac;enterprise;dotnet</PackageTags>
+    <Copyright>Copyright © 2026 kzxl. All rights reserved.</Copyright>
+    <VersionPrefix>1.0.0</VersionPrefix>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+  </PropertyGroup>
+</Project>
